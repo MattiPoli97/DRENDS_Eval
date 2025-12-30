@@ -1,4 +1,4 @@
-# RoboLab3D Depth Benchmark
+# DRENDS: A Dataset for Depth in Robotic Endoscopy with Dynamic Scenarios
 
 This repository provides a small evaluation framework to benchmark different monocular depth estimation models on the DRENDS dataset.
 
