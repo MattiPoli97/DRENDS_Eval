@@ -1,75 +1,121 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# --- CONFIG ---
-DATA_ROOT="./ExVivo_data"         
-OUT_ROOT="./ExVivo_results"    
-PY="python3"                        
-SCRIPT="__main__.py"                
-FOLDER_GLOB="*"                     
-FORCE=0                             
-# -------------------
+DATA_ROOTS=(
+  #"/Volumes/One Touch/DRENDS/DRENDS_ExVivo_Sequences"
+  "/Volumes/One Touch/DRENDS/DRENDS_Phantom_Sequences"
+)
 
-MODELS=(midas damv2 damv2_metric zoedepth monodepth2 depthpro)
+OUT_ROOTS=(
+  #"/Volumes/One Touch/DRENDS/17_03_26/EXvivo_results"
+  "/Volumes/One Touch/DRENDS/17_03_26/Phantom_results"
+)
 
-EXTRA_midas=(--midas_type DPT_Hybrid)
-EXTRA_damv2=(--damv2_size small)
-EXTRA_damv2_metric=(--damv2m_size Base --damv2m_domain Indoor --damv2m_max_depth 20.0)
-EXTRA_zoedepth=(--zoe_max_depth 0.6)
-EXTRA_depthpro=()
-EXTRA_monodepth2=(--monodepth2_ckpt mono_640x192)
+SCENES=(
+  #"Seq00_Colon_Ext"
+  #"Seq04_Intestine_Med"
+  #"Seq08_Stomach_High"
+  #"Seq09_Liver_Ext"
+  "Seq13_Pancreas_Med"
+)
 
-mkdir -p "$OUT_ROOT"
-while IFS= read -r -d '' SCENE_DIR; do
-  [ -d "$SCENE_DIR" ] || continue
-  SCENE_NAME="$(basename "$SCENE_DIR")"
+PY="python3"
+SCRIPT="__main__.py"
+FOLDER_GLOB="*"
+FORCE=0
 
-  for model in "${MODELS[@]}"; do
-    varname="EXTRA_${model}"
+MODELS=(foundationstereo)
 
-    if [ "$model" = "depthpro" ]; then
-      extra_args=()
-    else
-      eval "extra_args=(\"\${${varname}[@]}\")"
-    fi
+for i in "${!DATA_ROOTS[@]}"; do
+  DATA_ROOT="${DATA_ROOTS[$i]}"
+  OUT_ROOT="${OUT_ROOTS[$i]}"
 
-    OUT_DIR="${OUT_ROOT}/${SCENE_NAME}/${model}"
-    mkdir -p "$OUT_DIR"
+  mkdir -p "$OUT_ROOT"
 
-    if [ "$FORCE" -eq 0 ] && { [ -s "${OUT_DIR}/metrics_summary_raw.json" ] || [ -s "${OUT_DIR}/metrics_summary_metricized.json" ]; }; then
-      echo "[SKIP] ${SCENE_NAME} / ${model} (summary exists; set FORCE=1 to rerun)"
+  while IFS= read -r -d '' SCENE_DIR; do
+    [ -d "$SCENE_DIR" ] || continue
+    SCENE_NAME="$(basename "$SCENE_DIR")"
+    # check if scene is in the provied list of scenes to run (if SCENES variable is set)
+    if [ -n "${SCENES:-}" ] && [[ ! " ${SCENES[*]} " =~ " ${SCENE_NAME} " ]]; then
+      echo "[SKIP] ${SCENE_NAME} (not in SCENES list)"
       continue
     fi
 
-    echo "=== Running ${model} on ${SCENE_NAME} ==="
-    echo "Data -> $SCENE_DIR"
-    echo "Out  -> $OUT_DIR"
+    for model in "${MODELS[@]}"; do
 
-    LOG="${OUT_DIR}/run.log"
-    (
-      set -x
-      if [ "$model" = "depthpro" ]; then
-        "$PY" "$SCRIPT" \
-          --data_path "$SCENE_DIR" \
-          --model "$model" \
-          --output_path "$OUT_DIR" \
-          --batch_size 1 \
-          --num_workers 8 \
-          --headless
-      else
-        "$PY" "$SCRIPT" \
-          --data_path "$SCENE_DIR" \
-          --model "$model" \
-          --output_path "$OUT_DIR" \
-          --batch_size 1 \
-          --num_workers 0 \
-          --headless \
-          "${extra_args[@]}"
+      OUT_DIR="${OUT_ROOT}/${SCENE_NAME}/${model}"
+      mkdir -p "$OUT_DIR"
+
+      if [ "$FORCE" -eq 0 ] && { [ -s "${OUT_DIR}/metrics_summary_raw.json" ] || [ -s "${OUT_DIR}/metrics_summary_metricized.json" ]; }; then
+        echo "[SKIP] ${SCENE_NAME} / ${model} (summary exists; set FORCE=1 to rerun)"
+        continue
       fi
-    ) 2>&1 | tee "$LOG"
 
-    echo "=== Done ${model} on ${SCENE_NAME} ==="
-  done
-done < <(find "$DATA_ROOT" -maxdepth 1 -mindepth 1 -type d -name "$FOLDER_GLOB" -print0 | sort -z)
+      echo "=== Running ${model} on ${SCENE_NAME} ==="
+      echo "Data -> $SCENE_DIR"
+      echo "Out  -> $OUT_DIR"
 
-echo "All scenes & models finished. Results under: $OUT_ROOT"
+      LOG="${OUT_DIR}/run.log"
+
+      cmd=(
+        "$PY" "$SCRIPT"
+        --data_path "$SCENE_DIR"
+        --model "$model"
+        --output_path "$OUT_DIR"
+        --batch_size 1
+        --headless
+        --debug
+      )
+
+      case "$model" in
+        depthpro)
+          cmd+=(--num_workers 8
+                --store_pngs
+              )
+          ;;
+        damv2)
+          cmd+=(
+            --num_workers 0
+            --store_pngs
+
+          )
+          ;;
+        raft)
+          cmd+=(
+            --num_workers 0
+            --store_pngs
+      
+            --raft_ckpt "models/raftstereo-middlebury.pth"
+          )
+          ;;
+        foundationstereo)
+          cmd+=(
+            --num_workers 0
+            --store_pngs
+
+            --fs_ckpt "pretrained_models/23-51-11/model_best_bp2.pth"
+            --fs_root "./FoundationStereo"
+            --fs_iters 32
+            --fs_scale 1.0
+            --debug
+          )
+          ;;
+        *)
+          cmd+=(
+            --num_workers 0
+            --store_pngs
+          )
+          ;;
+      esac
+
+      (
+        set -x
+        "${cmd[@]}"
+      ) 2>&1 | tee "$LOG"
+
+      echo "=== Done ${model} on ${SCENE_NAME} ==="
+    done
+  done < <(find "$DATA_ROOT" -maxdepth 1 -mindepth 1 -type d -name "$FOLDER_GLOB" -print0 | sort -z)
+
+  echo "All scenes & models finished. Results under: $OUT_ROOT"
+done

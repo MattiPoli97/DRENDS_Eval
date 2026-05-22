@@ -23,8 +23,8 @@ class RoboLab3D():
         self.gt_images_right = sorted([f for f in self.gt_path_right.iterdir() if f.suffix == ".tiff"]) 
         self.gt_masks_left = sorted([f for f in self.gt_path_mask_left.iterdir() if f.suffix == ".png"])
         self.gt_masks_right = sorted([f for f in self.gt_path_mask_right.iterdir() if f.suffix == ".png"])
-   
-        self.img_size = cv2.imread(self.images_left[0]).shape[:2]
+
+        self.img_size = cv2.imread(str(self.images_left[0])).shape[:2]  # (H, W)
         
         data_list = []
 

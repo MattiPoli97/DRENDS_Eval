@@ -17,8 +17,18 @@ from metrics import absolute_scale_eval, aligned_scale_eval, temporal_consistenc
 from models.interfaces import ( 
     BaseInterface,
     DAMv2, DAMv2_Metric,
-    MiDaS, ZoeDepthInterface, DepthProInterface, MonoDepth2,
+    MiDaS, ZoeDepthInterface, DepthProInterface, MonoDepth2, RAFTStereo, FoundationStereo, STTRInterface
 )
+import os
+from PIL import Image
+
+import torch
+# Backfill torch.compiler.is_compiling for PyTorch < 2.1
+if not hasattr(torch, "compiler"):
+    import types
+    torch.compiler = types.SimpleNamespace(is_compiling=lambda: False)
+elif not hasattr(torch.compiler, "is_compiling"):
+    torch.compiler.is_compiling = lambda: False
 
 # ------------------------ helpers ------------------------
 def collate_paths(batch):
@@ -29,14 +39,29 @@ def collate_paths(batch):
             out[k].append(v)
     return out
 
-def normalize_for_save(m):
-    """Min-max -> 8-bit PNG (visualization only)."""
+def normalize_for_save(m, valid_mask=None):
+    """Min-max over valid pixels -> 8-bit. Invalid pixels -> 128 (mid-gray)."""
     m = np.asarray(m).astype(np.float32)
-    vmin = np.nanmin(m)
-    vmax = np.nanmax(m)
+    
+    if valid_mask is not None:
+        vals = m[valid_mask & np.isfinite(m)]
+    else:
+        vals = m[np.isfinite(m)]
+    
+    if vals.size == 0:
+        return np.full_like(m, 128, dtype=np.uint8)
+    
+    vmin, vmax = vals.min(), vals.max()
+    
     if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
-        return np.zeros_like(m, dtype=np.uint8)
-    out = (np.clip((m - vmin) / (vmax - vmin), 0, 1) * 255.0).astype(np.uint8)
+        return np.full_like(m, 128, dtype=np.uint8)
+    
+    out = np.full_like(m, 128, dtype=np.uint8)  # default: mid-gray for invalid
+    finite_mask = np.isfinite(m) if valid_mask is None else (valid_mask & np.isfinite(m))
+    out[finite_mask] = (np.clip(
+        (m[finite_mask] - vmin) / (vmax - vmin), 0, 1
+    ) * 255.0).astype(np.uint8)
+    
     return out
 
 def make_depth_model(name: str, img_size, **kwargs) -> BaseInterface:
@@ -58,14 +83,23 @@ def make_depth_model(name: str, img_size, **kwargs) -> BaseInterface:
         return DepthProInterface(img_size, **kwargs)
     if name == "monodepth2":
         return MonoDepth2(img_size, **kwargs)
+    if name == "raft":
+        return RAFTStereo(img_size, **kwargs)
+    if name == "foundationstereo":
+        return FoundationStereo(img_size, **kwargs)
+    if name == "sttr":
+        return STTRInterface(img_size, **kwargs)
     raise ValueError(f"Unknown model name: {name}")
 
-def model_infer(model: BaseInterface, image_path: str) -> np.ndarray:
-    """
-    Run the model on a single image path and return depth (H,W) float32.
-    All our model interfaces implement __call__(path)->np.ndarray.
-    """
-    depth = model(image_path)
+def model_infer(model: BaseInterface, image_path: str,
+                right_path: str = None) -> np.ndarray:
+    if isinstance(model, (RAFTStereo, FoundationStereo)):  # <-- add FoundationStereo
+        if right_path is None:
+            raise ValueError(f"{type(model).__name__} requires a right image path.")
+        depth = model(image_path, right_path)
+    else:
+        depth = model(image_path)
+
     if not isinstance(depth, np.ndarray):
         depth = np.asarray(depth)
     if depth.ndim == 3 and depth.shape[0] == 1:
@@ -126,14 +160,14 @@ def _load_gt_and_mask(gt_path, mask_path):
 
 def _valid_mask_for_alignment(gt, pred, user_mask):
     eps = 1e-6
-    v = user_mask & np.isfinite(gt) & np.isfinite(pred) & (gt > eps) & (pred > eps)
+    v = user_mask & np.isfinite(gt) & (gt > eps) & np.isfinite(pred) & (pred > eps)
     return v
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate depth models on RoboLab3D (masked metrics).")
     parser.add_argument("--data_path", type=str, required=True, help="Path to the dataset root")
-    parser.add_argument("--model", type=str, default="monodepth2",
-                        help="Model: damv2 | damv2_metric | midas | zoedepth | depthpro | monodepth2 | metric3d | unidepth")
+    parser.add_argument("--model", type=str, default="raft",
+                        help="Model: damv2 | damv2_metric | midas | zoedepth | depthpro | monodepth2 | raft ")
     parser.add_argument("--output_path", type=str, required=True, help="Where to save predictions & summary")
     parser.add_argument("--batch_size", type=int, default=1, help="Keep 1 (interfaces infer per-path)")
     parser.add_argument("--num_workers", type=int, default=0)
@@ -147,12 +181,35 @@ def parse_args():
     parser.add_argument("--zoe_name", type=str, default="zoedepth_nk")
     parser.add_argument("--monodepth2_ckpt", type=str, default="mono_640x192")
 
-    parser.add_argument("--damv2m_max_depth", type=float, default=5.0)
-    parser.add_argument("--zoe_max_depth", type=float, default=0.6)
+    parser.add_argument("--damv2m_max_depth", type=float, default=0.6)
+    parser.add_argument("--zoe_max_depth", type=float, default=0.2)
     parser.add_argument("--headless", action="store_true", help="Visualization")
     parser.add_argument("--debug", action="store_true", help="Debug prints")
     parser.add_argument("--store_pngs", action="store_true", help="Store visual PNGs of predictions")
+
+    parser.add_argument("--raft_ckpt",       type=str,   default="models/raftstereo-middlebury.pth")
+    parser.add_argument("--raft_root",       type=str,   default="./RAFT-Stereo")
+    parser.add_argument("--raft_iters",      type=int,   default=32)
+    parser.add_argument("--raft_baseline",   type=float, default=5.479673825671317e-3,
+                        help="Camera baseline in metres (enables metric depth output)")
+    parser.add_argument("--raft_focal_px",   type=float, default=1967.78,
+                        help="Focal length in pixels (enables metric depth output)")
+    parser.add_argument("--raft_cx_diff",    type=float, default=0.0)
+    parser.add_argument("--raft_mixed_prec", action="store_true")
     
+    parser.add_argument("--fs_ckpt",       type=str,   default="pretrained_models/23-51-11/model_best_bp2.pth")
+    parser.add_argument("--fs_root",       type=str,   default="./FoundationStereo")
+    parser.add_argument("--fs_iters",      type=int,   default=32)
+    parser.add_argument("--fs_scale",      type=float, default=1.0)
+    parser.add_argument("--fs_hiera",      action="store_true")
+    parser.add_argument("--fs_baseline",   type=float, default=5.479673825671317e-3)
+    parser.add_argument("--fs_focal_px",   type=float, default=1967.78)
+    parser.add_argument("--fs_mixed_prec", action="store_true")
+
+    parser.add_argument("--depthpro_ckpt_dir", type=str, default="./checkpoints")
+    parser.add_argument("--depthpro_root", type=str, default=".", help="Root dir for DepthPro code (if not using installed package)")
+    parser.add_argument("--depthpro_installed", action="store_true")
+
     return parser.parse_args()
 
 def build_dataloader(args):
@@ -183,9 +240,40 @@ def build_model(args, img_size):
     elif args.model.lower() == "zoedepth":
         model = make_depth_model("zoedepth", img_size, max_depth=args.zoe_max_depth)
     elif args.model.lower() == "depthpro":
-        model = make_depth_model("depthpro", img_size)
+        model = make_depth_model("depthpro", img_size,
+                            ckpt_dir=args.depthpro_ckpt_dir,
+                            depth_pro_root=args.depthpro_root,
+                            use_installed_pkg=args.depthpro_installed)
     elif args.model.lower() == "monodepth2":
         model = make_depth_model("monodepth2", img_size, model_type=args.monodepth2_ckpt)
+    elif args.model.lower() == "raft":
+        model = make_depth_model("raft", img_size,
+                                ckpt_path=args.raft_ckpt,
+                                raft_stereo_root=args.raft_root,
+                                valid_iters=args.raft_iters,
+                                mixed_precision=args.raft_mixed_prec,
+                                baseline_m=args.raft_baseline,
+                                focal_px=args.raft_focal_px,
+                                cx_diff=args.raft_cx_diff)
+    elif args.model.lower() == "foundationstereo":
+        model = make_depth_model("foundationstereo", img_size,
+                             ckpt_path=args.fs_ckpt,
+                             foundation_stereo_root=args.fs_root,
+                             valid_iters=args.fs_iters,
+                             scale=args.fs_scale,
+                             hiera=args.fs_hiera,
+                             mixed_precision=args.fs_mixed_prec,
+                             baseline_m=args.fs_baseline,
+                             focal_px=args.fs_focal_px)
+    elif args.model.lower() == "sttr":
+        model = make_depth_model("sttr", img_size,
+                             ckpt_path=args.sttr_ckpt,
+                             sttr_root=args.sttr_root,
+                             downsample=args.sttr_downsample,
+                             channel_dim=args.sttr_channels,
+                             num_attn_layers=args.sttr_layers,
+                             baseline_m=args.sttr_baseline,
+                             focal_px=args.sttr_focal_px)
     else:
         raise ValueError(f"Unknown --model {args.model}")
     return model
@@ -214,6 +302,8 @@ def main():
     acc_raw    = {k: [] for k in keys}
     acc_aligned = {k: [] for k in keys_aligned}
 
+    #take the first 15 samples for quick debugging
+    dataloader = list(dataloader)[:1]
 
     for batch in tqdm(dataloader, desc=f"Evaluating {args.model}"):
         left_path   = batch.get("left_image",   [None])[0]
@@ -223,47 +313,130 @@ def main():
         mask_left   = batch.get("mask_left",    [None])[0]
         mask_right  = batch.get("mask_right",   [None])[0]
         
-        def process_one(img_path, gt_path, mask_path, suffix, debug):
+        def process_one(img_path, gt_path, mask_path, suffix, debug, right_path=None):
             if img_path is None or gt_path is None or mask_path is None:
                 return            
-            pred = model_infer(model, img_path)  
-            pred = pred.astype(np.float64) * 1000.0  # convert to mm
-            gt, mask = _load_gt_and_mask(gt_path, mask_path)
-            valid = _valid_mask_for_alignment(gt, pred, mask)
             
-            gt_valid = gt[valid & (gt > 0)].astype(np.float64)  
-            gt_min = (gt_valid.min()) if gt_valid.size > 0 else 0.0
-            gt_max = (gt_valid.max()) if gt_valid.size > 0 else 0.0
+            # 1) Inference: Prediction in [m]
+            pred_m = model_infer(model, img_path, right_path=right_path)
+            pred_m = pred_m.astype(np.float64)
 
-            if args.model== "midas" or args.model == "damv2":
-                gt_min = 100
-                gt_max = 600
-                pred, _ = depth_to_metric(pred, gt_min, gt_max, mask=mask)
-       
+            # save an image of the raw prediction for debugging
+            if debug:
+                pred_max = np.nanmax(pred_m)
+                pred_min = np.nanmin(pred_m)
+                print("Unique values in prediction (raw):", np.unique(pred_m))
+                print(f"DEBUG: Predicted depth range before alignment: [{pred_min:.3f}, {pred_max:.3f}] m")
+                #normali between 0 and 1 and the apply colormap
+                pred_vis = cv2.normalize(pred_m*1000, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                print("Number of each unique value:", {v: np.sum(pred_vis == v) for v in np.unique(pred_vis)})
+                pred_color = cv2.applyColorMap(pred_vis, cv2.COLORMAP_INFERNO)
+                cv2.imwrite(str(out_dir / f"{Path(img_path).stem}_{suffix}_pred_raw_colored.png"), pred_color)
+            
+
+            # 2) Load GT and mask in [mm], get valid pixels for alignment/metrics
+            gt, mask = _load_gt_and_mask(gt_path, mask_path)
+            if debug:
+                pred_vis = normalize_for_save(gt, valid_mask=mask)
+                cv2.imwrite(str(out_dir / f"{Path(img_path).stem}_{suffix}_gt_valid.png"), pred_vis)
+                pred_color = cv2.applyColorMap(pred_vis, cv2.COLORMAP_INFERNO)
+                cv2.imwrite(str(out_dir / f"{Path(img_path).stem}_{suffix}_gt_valid_colored.png"), pred_color)
+
+            input("Press Enter to continue...")  # pause for debug visualization
+            if args.model == "midas" or args.model == "damv2":
+                gt_valid_tmp = gt[mask & np.isfinite(gt) & (gt > 1e-6)]
+                gt_min = 100.0
+                gt_max = 200.0
+                pred_m, _ = depth_to_metric(pred_m, gt_min / 1000.0, gt_max / 1000.0, mask=mask)
+                pred_m = pred_m.astype(np.float64)
+            
+            pred_mm = pred_m * 1000.0
+
+            valid = _valid_mask_for_alignment(gt, pred_mm, mask)
+            
+            gt_valid   = gt[valid]
+            pred_valid = pred_mm[valid]
+
+            if debug:
+                vmin     = np.nanmin(gt_valid)
+                vmax     = np.nanmax(gt_valid)
+                pred_min = np.nanmin(pred_valid)
+                pred_max = np.nanmax(pred_valid)
+
+                def normalize_for_save_full(x, vmin, vmax, valid_mask=None):
+                    x = x.astype(np.float32).copy()
+                    x = (x - vmin) / (vmax - vmin + 1e-8)
+                    x = np.clip(x, 0, 1)
+                    x = (x * 255).astype(np.uint8)
+                    if valid_mask is not None:
+                        x[~valid_mask] = 0
+                    return x
+
+                print(f"DEBUG: GT range [{vmin:.3f}, {vmax:.3f}] mm | Pred range [{pred_min:.3f}, {pred_max:.3f}] mm")
+                gt_vis   = normalize_for_save_full(gt,      vmin, vmax,     valid).astype(np.uint8)
+                pred_vis = normalize_for_save_full(pred_mm, pred_min, pred_max, valid)
+                print("Ranges after norm: GT [{}, {}], Pred [{}, {}]".format(
+                    gt_vis.min(), gt_vis.max(), pred_vis.min(), pred_vis.max()))
+                gt_map_colored   = cv2.applyColorMap(gt_vis,   cv2.COLORMAP_INFERNO)
+                pred_map_colored = cv2.applyColorMap(pred_vis, cv2.COLORMAP_INFERNO)
+                print(f"DEBUG: saving GT and Pred visualizations to {out_dir}")
+                cv2.imwrite(str(out_dir / f"{Path(img_path).stem}_{suffix}_gt_colored.png"),   gt_map_colored.astype(np.uint8))
+                cv2.imwrite(str(out_dir / f"{Path(img_path).stem}_{suffix}_pred_colored.png"), pred_map_colored.astype(np.uint8))
+
+
             # 1) RAW metrics 
-            m_raw = absolute_scale_eval(gt, pred, mask, min_depth=1e-6)
+            m_raw = absolute_scale_eval(gt, pred_mm, mask, min_depth=1e-6)
             for k in keys: acc_raw[k].append(m_raw[k])
 
             # 2) Aligned metrics
-            m_met = aligned_scale_eval(gt, pred, mask)
+            m_met = aligned_scale_eval(gt, pred_mm, mask)
             for k in keys_aligned: acc_aligned[k].append(m_met[k])
 
             # 3) Temporl consistency 
-            dtce_aligned = temporal_consistency_eval(gt, pred, mask, aligned=True)
-            dtce = temporal_consistency_eval(gt, pred, mask, aligned=False)
+            dtce_aligned = temporal_consistency_eval(gt, pred_mm, mask, aligned=True)
+            dtce = temporal_consistency_eval(gt, pred_mm, mask, aligned=False)
            
             stem = Path(img_path).stem
+
             if args.store_pngs:
-                cv2.imwrite(str(out_dir / f"{stem}_{suffix}.png"),     normalize_for_save(pred))
-  
-            vmin = np.nanmin(gt[valid])
-            vmax = np.nanmax(gt[valid])
+                cv2.imwrite(str(out_dir / f"{stem}_{suffix}.png"), normalize_for_save(pred_mm))
+
+                # Colour visualization clipped to GT valid range (units now match)
+                min_valid = np.nanmin(gt[valid])
+                max_valid = np.nanmax(gt[valid])
+
+                pred_vis_color = np.where(valid, pred_mm, np.nan)
+                pred_vis_color = np.clip(pred_vis_color, min_valid, max_valid)
+
+                pred_u8    = normalize_for_save(pred_vis_color, valid_mask=valid)
+                pred_color = cv2.applyColorMap(pred_u8, cv2.COLORMAP_INFERNO)
+
+                pred_color_rgb = cv2.cvtColor(pred_color, cv2.COLOR_BGR2RGB)
+                fig_color, ax_color = plt.subplots(figsize=(6, 4))
+                ax_color.imshow(pred_color_rgb)
+                ax_color.axis('off')
+                norm = plt.Normalize(vmin=min_valid, vmax=max_valid)
+                sm   = plt.cm.ScalarMappable(cmap='inferno', norm=norm)
+                cbar = fig_color.colorbar(sm, ax=ax_color, orientation='vertical', fraction=0.046, pad=0.04)
+                cbar.set_label('Depth (mm)')
+                plt.tight_layout()
+                plt.savefig(str(out_dir / f"{stem}_{suffix}_pred_colorbar.png"))
+                plt.close(fig_color)
+                cv2.imwrite(str(out_dir / f"{stem}_{suffix}_pred_color.png"), pred_color)
+
+
+            # Side-by-side GT vs Pred (shared colour scale in mm)
+            min_valid = np.nanmin(gt[valid])
+            max_valid = np.nanmax(gt[valid])
+
+            min_valid_pred = np.nanmin(pred_mm[valid])
+            max_valid_pred = np.nanmax(pred_mm[valid])
 
             fig, axs = plt.subplots(1, 2, figsize=(10, 4))
-            im0 = axs[0].imshow(np.where(valid, gt, np.nan), vmin=vmin, vmax=vmax, cmap='viridis')
+            im0 = axs[0].imshow(np.where(valid, gt,      np.nan), vmin=min_valid, vmax=max_valid, cmap='inferno')
             axs[0].set_title('GT (valid pixels)')
             fig.colorbar(im0, ax=axs[0], fraction=0.046, pad=0.04)
-            im1 = axs[1].imshow(np.where(valid, pred, np.nan), vmin=vmin, vmax=vmax, cmap='viridis')
+            im1 = axs[1].imshow(np.where(valid, pred_mm, np.nan), vmin=min_valid_pred, vmax=max_valid_pred, cmap='inferno')
             axs[1].set_title('Prediction (valid pixels)')
             fig.colorbar(im1, ax=axs[1], fraction=0.046, pad=0.04)
             plt.tight_layout()
@@ -271,25 +444,35 @@ def main():
                 plt.savefig(str(out_dir / f"{stem}_gt_pred_metric_{suffix}.png"))
             if not args.headless:
                 plt.show()
-            
             plt.close(fig)
             
             return m_raw, m_met, dtce, dtce_aligned
 
-        m_raw_left, m_met_left, dtce_left, dtce_aligned_left = process_one(left_path,  gt_left,  mask_left,  "L", args.debug)
-        m_raw_right, m_met_right, dtce_right, dtce_aligned_right = process_one(right_path, gt_right, mask_right, "R", args.debug)
+        # define once at the top of main() or as a module-level tuple for reuse
+        STEREO_MODELS = (RAFTStereo, FoundationStereo, STTRInterface)
+
+        # then both process_one calls become:
+        m_raw_left, m_met_left, dtce_left, dtce_aligned_left = process_one(
+            left_path, gt_left, mask_left, "L", args.debug,
+            right_path=right_path if isinstance(model, STEREO_MODELS) else None
+        )
+
+        # m_raw_right, m_met_right, dtce_right, dtce_aligned_right = process_one(
+        #     right_path, gt_right, mask_right, "R", args.debug,
+        #     right_path=left_path if isinstance(model, STEREO_MODELS) else None
+        # )
 
         per_image_metrics = {
             "left_image": str(left_path),
             "right_image": str(right_path),
             "left_raw": {k: float(m_raw_left[k]) for k in keys},
             "left_aligned": {k: float(m_met_left[k]) for k in keys_aligned},
-            "right_raw": {k: float(m_raw_right[k]) for k in keys},
-            "right_aligned": {k: float(m_met_right[k]) for k in keys_aligned},
+            #"right_raw": {k: float(m_raw_right[k]) for k in keys},
+            #"right_aligned": {k: float(m_met_right[k]) for k in keys_aligned},
             "temporal_left": dtce_left["DTCE"],
-            "temporal_right": dtce_right["DTCE"],
+            #"temporal_right": dtce_right["DTCE"],
             "temporal_aligned_left": dtce_aligned_left["DTCE"],
-            "temporal_aligned_right": dtce_aligned_right["DTCE"]
+            #"temporal_aligned_right": dtce_aligned_right["DTCE"]
         }
         per_image_json_path = out_dir / "single_image_metrics.json"
         if per_image_json_path.exists():
@@ -325,37 +508,37 @@ def main():
     for i, img in enumerate(all_metrics):
         if "temporal_left" in img and i < len(left_raw_list):
             left_raw_list[i]["temporal_left"] = img["temporal_left"]
-    right_raw_list = [img["right_raw"] for img in all_metrics if "right_raw" in img]
-    for i, img in enumerate(all_metrics):
-        if "temporal_right" in img and i < len(right_raw_list):
-            right_raw_list[i]["temporal_right"] = img["temporal_right"]
+    #right_raw_list = [img["right_raw"] for img in all_metrics if "right_raw" in img]
+    #for i, img in enumerate(all_metrics):
+    #    if "temporal_right" in img and i < len(right_raw_list):
+    #        right_raw_list[i]["temporal_right"] = img["temporal_right"]
     left_aligned_list = [img["left_aligned"] for img in all_metrics if "left_aligned" in img]
     for i, img in enumerate(all_metrics):
         if "temporal_aligned_left" in img and i < len(left_aligned_list):
             left_aligned_list[i]["temporal_aligned_left"] = img["temporal_aligned_left"]
-    right_aligned_list = [img["right_aligned"] for img in all_metrics if "right_aligned" in img]
-    for i, img in enumerate(all_metrics):
-        if "temporal_aligned_right" in img and i < len(right_aligned_list):
-            right_aligned_list[i]["temporal_aligned_right"] = img["temporal_aligned_right"]
+    #right_aligned_list = [img["right_aligned"] for img in all_metrics if "right_aligned" in img]
+    #for i, img in enumerate(all_metrics):
+    #    if "temporal_aligned_right" in img and i < len(right_aligned_list):
+    #        right_aligned_list[i]["temporal_aligned_right"] = img["temporal_aligned_right"]
 
     keys_left = keys.copy()
-    keys_right = keys.copy()
+    #keys_right = keys.copy()
     keys_aligned_left = keys_aligned.copy()
-    keys_aligned_right = keys_aligned.copy()
+    #keys_aligned_right = keys_aligned.copy()
     if "temporal_left" not in keys:
         keys_left.append("temporal_left")
-    if "temporal_right" not in keys:
-        keys_right.append("temporal_right")
+    #if "temporal_right" not in keys:
+    #    keys_right.append("temporal_right")
     if "temporal_aligned_left" not in keys_aligned:
         keys_aligned_left.append("temporal_aligned_left")
-    if "temporal_aligned_right" not in keys_aligned:
-        keys_aligned_right.append("temporal_aligned_right")
+    #if "temporal_aligned_right" not in keys_aligned:
+    #    keys_aligned_right.append("temporal_aligned_right")
 
     summary = {
         "left_raw": compute_stats(left_raw_list, keys_left),
-        "right_raw": compute_stats(right_raw_list, keys_right),
+    #    "right_raw": compute_stats(right_raw_list, keys_right),
         "left_aligned": compute_stats(left_aligned_list, keys_aligned_left),
-        "right_aligned": compute_stats(right_aligned_list, keys_aligned_right)
+    #    "right_aligned": compute_stats(right_aligned_list, keys_aligned_right)
     }
 
     (out_dir / "metrics_summary.json").write_text(json.dumps(summary, indent=2))

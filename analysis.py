@@ -101,7 +101,9 @@ def plot_per_batch_and_by_light(batch_names, metrics_per_batch, saving_folder):
                     means.append(mean_v)
                     stds.append(std_v)
                 x_shift = x_batches - total_width / 2 + (i + 0.5) * bar_width
-                plt.errorbar(x_shift, means, yerr=stds, fmt="o", linestyle="None", capsize=3, label=model)
+                #plot only raft and foundatonstereo
+                if model in ["raft", "foundationstereo"]:
+                    plt.errorbar(x_shift, means, yerr=stds, fmt="o", linestyle="None", capsize=3, label=model)
 
             plt.title(f"{top_key} - {metric} (mean ± std) across batches")
             plt.xlabel("Batch")
@@ -134,12 +136,14 @@ def plot_per_batch_and_by_light(batch_names, metrics_per_batch, saving_folder):
                 agg_means = [np.nanmean(light_means[L]) if light_means[L] else np.nan for L in LIGHT_LEVELS]
                 agg_stds = [np.nanmean(light_stds[L]) if light_stds[L] else np.nan for L in LIGHT_LEVELS]
                 x_shift = x_lights - total_width / 2 + (mi + 0.5) * model_width
-                plt.errorbar(x_shift, agg_means, yerr=agg_stds, fmt="o", linestyle="None", capsize=3, label=model)
+                if model in ["raft", "foundationstereo"]:
+                    plt.errorbar(x_shift, agg_means, yerr=agg_stds, fmt="o", linestyle="None", capsize=3, label=model)
 
             plt.xticks(x_lights, LIGHT_LEVELS)
             plt.xlabel("Light level")
             plt.ylabel(metric)
             plt.title(f"{top_key} - {metric} (mean ± std) by light level")
+            plt.legend()
             plt.tight_layout()
             out_file = saving_folder / f"{top_key}_{metric}_by_light.png"
             plt.savefig(out_file)
